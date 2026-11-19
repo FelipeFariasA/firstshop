@@ -74,7 +74,7 @@ nav.tabs button {
 nav.tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
 .filters label { font-size: 13px; color: var(--text-2); display: flex; gap: 6px; align-items: center; }
-select, input[type="text"], input[type="search"], input[type="number"] {
+select, input[type="text"], input[type="search"], input[type="number"], input[type="date"] {
   font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; padding: 6px 10px; max-width: 100%;
 }
@@ -307,6 +307,25 @@ footer { color: var(--text-3); font-size: 12px; margin: 24px 0 8px; text-align: 
         </div>
       </div>
     </div>
+    <div class="card" id="syncCard" style="margin-bottom:12px">
+      <h2>Conexión automática con tu banco (Tupana)</h2>
+      <p class="sub">Trae tus movimientos directo desde el banco, sin descargar cartolas. Usa tu conexión de Tupana en Claude: el acceso es solo de lectura y nunca puede mover plata. Cada vez que abras la app se actualiza sola.</p>
+      <div id="syncUnavailable" class="msg err hidden">La conexión automática solo funciona al abrir la app desde su link de Claude (claude.ai). Aquí puedes seguir importando cartolas.</div>
+      <div id="syncBody">
+        <ol class="small muted" style="margin:0 0 12px;padding-left:18px">
+          <li>En <a href="https://www.tupana.ai" target="_blank" rel="noopener">Tupana</a>, conecta tu banco (Tupana Connect → <b>Banco</b>: banco, RUT y clave de internet).</li>
+          <li>Aquí, toca <b>Buscar mis cuentas</b>, elige la empresa o cuenta y toca <b>Sincronizar</b>.</li>
+        </ol>
+        <div class="row">
+          <button class="btn" type="button" id="syncLoad">Buscar mis cuentas</button>
+          <select id="syncEntity" class="hidden" aria-label="Empresa o cuenta en Tupana"></select>
+          <label class="small muted row hidden" id="syncFromWrap">Desde <input type="date" id="syncFrom"></label>
+          <button class="btn primary hidden" type="button" id="syncGo">Sincronizar</button>
+          <button class="btn danger hidden" type="button" id="syncOff">Desconectar</button>
+        </div>
+        <div id="syncMsg"></div>
+      </div>
+    </div>
     <div class="card">
       <h2>Tus datos</h2>
       <p class="sub" id="dataInfo"></p>
@@ -375,7 +394,7 @@ const DISCRETIONARY = new Set(['Delivery y comida fuera', 'Compras', 'Entretenci
 
 /* ---------------- Estado ---------------- */
 const STORE_KEY = 'fugas-de-plata-v1';
-let state = { txs: [], userRules: {}, theme: null };
+let state = { txs: [], userRules: {}, theme: null, tupana: null };
 const ui = { tab: 'resumen', month: '', account: '', search: '', cat: '', type: '' };
 
 function load() {
@@ -1131,7 +1150,7 @@ $('#demoBtn').addEventListener('click', loadDemo);
 $('#demoBtn2').addEventListener('click', loadDemo);
 $('#clearBtn').addEventListener('click', () => {
   if (!confirm('¿Borrar todos los movimientos y reglas guardadas en este dispositivo?')) return;
-  state.txs = []; state.userRules = {}; save(); render();
+  state.txs = []; state.userRules = {}; state.tupana = null; save(); $('#syncEntity').innerHTML = ''; setSyncMsg(''); renderSync(); render();
 });
 let downloadsApi = null;
 try { window.claude?.use?.('downloads').then(d => { downloadsApi = d; }).catch(() => {}); } catch (e) {}
@@ -1178,12 +1197,153 @@ $('#themeBtn').addEventListener('click', () => {
   save(); applyTheme();
 });
 
+
+/* ---------------- Sincronización automática (Tupana) ---------------- */
+const TUPANA = 'Tupana';
+let mcpApi = null;
+let syncing = false;
+
+function tupanaPayload(res) {
+  let p = res && 'payload' in res ? res.payload : res;
+  if (p && typeof p === 'object' && typeof p.result === 'string') {
+    try { p = JSON.parse(p.result); } catch (e) { p = p.result; }
+  }
+  if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) {} }
+  return p;
+}
+
+function syncError(err) {
+  const code = err?.code;
+  const msgs = {
+    server_not_connected: 'No tienes Tupana conectado en Claude. Agrégalo en claude.ai → Configuración → Conectores y vuelve a intentar.',
+    needs_reauth: 'Tu conexión con Tupana expiró. Reconéctala en claude.ai → Configuración → Conectores.',
+    selection_required: 'Tienes más de una conexión de Tupana: elige cuál usar en el aviso de Claude y vuelve a intentar.',
+    not_in_manifest: 'No diste permiso a esta app para usar Tupana. Puedes activarlo en el menú Permisos de la página.',
+    approval_required: 'Esta app necesita tu aprobación para leer Tupana. Toca el botón de nuevo y acepta el permiso.',
+    blocked_by_policy: 'Tu organización bloquea este acceso a Tupana.',
+    server_unavailable: 'Tupana no respondió. Intenta de nuevo en unos minutos.',
+    tool_error: `Tupana respondió con un error: ${err?.message || 'sin detalle'}`,
+  };
+  return msgs[code] || `No se pudo conectar con Tupana (${code || err?.message || 'error'}).`;
+}
+
+function setSyncMsg(html, kind = 'ok') {
+  $('#syncMsg').innerHTML = html ? `<div class="msg ${kind}">${html}</div>` : '';
+}
+
+function renderSync() {
+  const t = state.tupana;
+  const hasEntities = $('#syncEntity').options.length > 0;
+  $('#syncEntity').classList.toggle('hidden', !hasEntities);
+  $('#syncFromWrap').classList.toggle('hidden', !hasEntities && !t);
+  $('#syncGo').classList.toggle('hidden', !hasEntities && !t);
+  $('#syncOff').classList.toggle('hidden', !t);
+  $('#syncLoad').textContent = hasEntities ? 'Actualizar lista' : 'Buscar mis cuentas';
+  if (!$('#syncFrom').value) {
+    const d = new Date(); d.setMonth(d.getMonth() - 6); d.setDate(1);
+    $('#syncFrom').value = d.toISOString().slice(0, 10);
+  }
+}
+
+async function loadEntities() {
+  if (!mcpApi) return;
+  $('#syncLoad').disabled = true;
+  setSyncMsg('Buscando tus cuentas en Tupana…');
+  try {
+    const p = tupanaPayload(await mcpApi.callTool(TUPANA, 'get_entity_info', { per_page: 100 }));
+    const list = Array.isArray(p?.results) ? p.results : [];
+    if (!list.length) { setSyncMsg('Tupana no tiene empresas ni cuentas asociadas a tu usuario. Primero conecta tu banco en Tupana.', 'err'); return; }
+    $('#syncEntity').innerHTML = list.map(e => `<option value="${esc(e.tax_id)}" data-name="${esc(e.name)}" ${state.tupana?.rut === e.tax_id ? 'selected' : ''}>${esc(e.name)} (${esc(e.tax_id)})</option>`).join('');
+    setSyncMsg(`Encontramos ${list.length} ${list.length === 1 ? 'cuenta' : 'cuentas'} en Tupana. Elige una y toca Sincronizar.`);
+  } catch (err) {
+    setSyncMsg(esc(syncError(err)), 'err');
+  } finally {
+    $('#syncLoad').disabled = false;
+    renderSync();
+  }
+}
+
+async function syncTupana({ auto = false } = {}) {
+  if (!mcpApi || syncing) return;
+  const opt = $('#syncEntity').selectedOptions[0];
+  const rut = opt ? opt.value : state.tupana?.rut;
+  const name = opt ? opt.dataset.name : state.tupana?.name;
+  if (!rut) { setSyncMsg('Primero toca Buscar mis cuentas y elige una.', 'err'); return; }
+  let from = $('#syncFrom').value;
+  if (auto && state.tupana?.lastSync) {
+    const d = new Date(state.tupana.lastSync); d.setDate(d.getDate() - 7);
+    from = d.toISOString().slice(0, 10);
+  }
+  syncing = true;
+  $('#syncGo').disabled = true;
+  setSyncMsg(auto ? 'Actualizando movimientos desde Tupana…' : 'Trayendo movimientos desde Tupana…');
+  try {
+    const existing = new Set(state.txs.map(t => t.id));
+    let page = 1, added = 0, read = 0, total = Infinity;
+    while (read < total && page <= 50) {
+      const p = tupanaPayload(await mcpApi.callTool(TUPANA, 'get_bank_movements', {
+        entity_rut: rut, date_from: from || null, page, per_page: 100,
+        fields: 'transaction_date,amount,description,bank,account_number',
+      }, { cache: false }));
+      const rows = Array.isArray(p?.results) ? p.results : [];
+      total = typeof p?.total === 'number' ? p.total : read + rows.length;
+      if (!rows.length) break;
+      read += rows.length;
+      for (const m of rows) {
+        const id = `tupana|${m.id}`;
+        const date = parseDate(m.transaction_date);
+        const amount = Number(m.amount);
+        const desc = String(m.description || '').trim() || 'Movimiento';
+        if (existing.has(id) || !date || !amount) continue;
+        existing.add(id);
+        const acct = String(m.account_number || '');
+        const account = `${m.bank || name}${acct ? ' ···' + acct.slice(-4) : ''}`;
+        state.txs.push({ id, date, desc, amount, account, merchant: merchantKey(desc), category: categorize(desc, amount), source: 'tupana' });
+        added++;
+      }
+      page++;
+    }
+    state.tupana = { rut, name, lastSync: new Date().toISOString() };
+    save();
+    const when = new Date(state.tupana.lastSync).toLocaleString('es-CL', { dateStyle: 'medium', timeStyle: 'short' });
+    setSyncMsg(`Conectado a <b>${esc(name)}</b>. ${added ? `Se agregaron ${added} movimientos nuevos.` : 'No había movimientos nuevos.'} Última actualización: ${esc(when)}`);
+    render();
+  } catch (err) {
+    setSyncMsg(esc(syncError(err)), 'err');
+  } finally {
+    syncing = false;
+    $('#syncGo').disabled = false;
+    renderSync();
+  }
+}
+
+$('#syncLoad').addEventListener('click', loadEntities);
+$('#syncGo').addEventListener('click', () => syncTupana());
+$('#syncOff').addEventListener('click', () => {
+  if (!confirm('¿Dejar de sincronizar con Tupana? Los movimientos ya importados se mantienen.')) return;
+  state.tupana = null; save(); $('#syncEntity').innerHTML = ''; setSyncMsg(''); renderSync();
+});
+
+function initSync() {
+  renderSync();
+  if (state.tupana) setSyncMsg(`Conectado a <b>${esc(state.tupana.name)}</b>. Última actualización: ${esc(new Date(state.tupana.lastSync).toLocaleString('es-CL', { dateStyle: 'medium', timeStyle: 'short' }))}`);
+  let use = null;
+  try { use = window.claude?.use?.('mcp'); } catch (e) {}
+  if (!use) { $('#syncUnavailable').classList.remove('hidden'); $('#syncBody').classList.add('hidden'); return; }
+  use.then(api => {
+    if (!api) { $('#syncUnavailable').classList.remove('hidden'); $('#syncBody').classList.add('hidden'); return; }
+    mcpApi = api;
+    if (state.tupana) syncTupana({ auto: true }); // actualización automática al abrir
+  }).catch(() => { $('#syncUnavailable').classList.remove('hidden'); $('#syncBody').classList.add('hidden'); });
+}
+
 /* ---------------- Inicio ---------------- */
 load();
 applyTheme();
 let startTab = 'resumen';
 try { startTab = localStorage.getItem(STORE_KEY + '-tab') || 'resumen'; } catch (e) {}
 setTab(['resumen', 'fugas', 'movimientos', 'importar'].includes(startTab) ? startTab : 'resumen');
+initSync();
 
 // expuesto para pruebas
 window.__fugas = { parseAmount, parseDate, merchantKey, categorize, parseCSV, analyze };
