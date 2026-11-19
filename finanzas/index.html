@@ -549,7 +549,7 @@ async function handleFiles(files) {
       } else {
         const buf = await file.arrayBuffer();
         let text = new TextDecoder('utf-8').decode(buf);
-        if (text.includes('�')) text = new TextDecoder('windows-1252').decode(buf);
+        if (text.includes('\uFFFD')) text = new TextDecoder('windows-1252').decode(buf);
         rows = parseCSV(text);
       }
       const hi = detectHeader(rows);
@@ -1133,11 +1133,24 @@ $('#clearBtn').addEventListener('click', () => {
   if (!confirm('¿Borrar todos los movimientos y reglas guardadas en este dispositivo?')) return;
   state.txs = []; state.userRules = {}; save(); render();
 });
-$('#exportBtn').addEventListener('click', () => {
-  const blob = new Blob([JSON.stringify({ txs: state.txs, userRules: state.userRules }, null, 1)], { type: 'application/json' });
+let downloadsApi = null;
+try { window.claude?.use?.('downloads').then(d => { downloadsApi = d; }).catch(() => {}); } catch (e) {}
+$('#exportBtn').addEventListener('click', async () => {
+  const json = JSON.stringify({ txs: state.txs, userRules: state.userRules }, null, 1);
+  const filename = `fugas-de-plata-respaldo-${new Date().toISOString().slice(0, 10)}.json`;
+  if (downloadsApi) {
+    try {
+      await downloadsApi.save({ filename, data: new Blob([json], { type: 'application/json' }) });
+      $('#importMsg').innerHTML = '<div class="msg ok">Respaldo descargado.</div>';
+    } catch (err) {
+      if (err?.code !== 'declined') $('#importMsg').innerHTML = `<div class="msg err">No se pudo descargar el respaldo (${esc(err?.code || err?.message || 'error')}).</div>`;
+    }
+    return;
+  }
+  const blob = new Blob([json], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `fugas-de-plata-respaldo-${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 });
