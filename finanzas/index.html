@@ -157,6 +157,9 @@ td select { font-size: 12px; padding: 3px 6px; }
 .drop {
   border: 2px dashed var(--border); border-radius: var(--radius); padding: 28px 16px; text-align: center; background: var(--surface);
 }
+.file-btn { position: relative; display: inline-block; overflow: hidden; }
+.file-btn input[type="file"] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; font-size: 100px; }
+textarea { width: 100%; font: 13px/1.4 ui-monospace, Menlo, monospace; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
 .drop.over { border-color: var(--accent); background: var(--surface-2); }
 .mapper { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 12px 0; }
 .mapper label { display: flex; flex-direction: column; font-size: 13px; color: var(--text-2); gap: 4px; }
@@ -283,11 +286,17 @@ footer { color: var(--text-3); font-size: 12px; margin: 24px 0 8px; text-align: 
       <p class="sub">Descarga la cartola desde la web de tu banco (Banco de Chile, Santander, BCI, BancoEstado, Scotiabank, Itaú, etc.) en <b>Excel o CSV</b> y súbela aquí. Puedes importar varias cuentas y varios meses; los movimientos repetidos se ignoran.</p>
       <div class="drop" id="drop">
         <p style="margin-top:0"><b>Arrastra aquí tu archivo</b> o</p>
-        <label class="btn primary" style="display:inline-block">Elegir archivo
-          <input type="file" id="fileInput" accept=".csv,.txt,.xlsx,.xls" multiple hidden>
-        </label>
+        <span class="file-btn btn primary">Elegir archivo
+          <input type="file" id="fileInput" accept=".csv,.txt,.xlsx,.xls,text/csv,text/plain,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple aria-label="Elegir archivo de cartola">
+        </span>
         <p class="muted small" style="margin-bottom:0">Tus datos no salen de tu navegador: se procesan y guardan solo en este dispositivo.</p>
       </div>
+      <details id="pasteBox" style="margin-top:12px">
+        <summary style="cursor:pointer;font-weight:600">¿No puedes subir el archivo? Pega los movimientos</summary>
+        <p class="sub" style="margin-top:8px">Abre la cartola en Excel (o en la web de tu banco), selecciona la tabla <b>incluyendo la fila de títulos</b> (Fecha, Descripción, Cargos, Abonos…), cópiala y pégala aquí.</p>
+        <textarea id="pasteText" rows="7" placeholder="Fecha	Descripción	Cargos	Abonos	Saldo&#10;01/10/2026	Remuneración	 	1.500.000	1.500.000&#10;03/10/2026	Comisión mantención	5.990	 	1.494.010"></textarea>
+        <div class="row" style="margin-top:8px"><button class="btn primary" type="button" id="pasteGo">Revisar movimientos pegados</button></div>
+      </details>
       <div id="importMsg"></div>
       <div id="mapperBox" class="hidden">
         <h2 style="margin-top:16px">Revisa las columnas</h2>
@@ -571,17 +580,22 @@ async function handleFiles(files) {
         if (text.includes('\uFFFD')) text = new TextDecoder('windows-1252').decode(buf);
         rows = parseCSV(text);
       }
-      const hi = detectHeader(rows);
-      const header = hi >= 0 ? rows[hi].map(c => String(c).trim()) : rows[0].map((_, i) => `Columna ${i + 1}`);
-      const body = rows.slice(hi >= 0 ? hi + 1 : 0);
-      const map = hi >= 0 ? guessMapping(header) : { date: -1, desc: -1, out: -1, inn: -1, amount: -1 };
-      pending = { name: file.name, header, rows: body, map };
-      showMapper();
+      startMapping(file.name, rows);
       return; // un archivo a la vez para confirmar columnas
     } catch (e) {
       msg.innerHTML = `<div class="msg err">${esc(file.name)}: ${esc(e.message)}</div>`;
     }
   }
+}
+
+function startMapping(name, rows) {
+  if (!rows || !rows.length) throw new Error('no encontramos filas con datos.');
+  const hi = detectHeader(rows);
+  const header = hi >= 0 ? rows[hi].map(c => String(c).trim()) : rows[0].map((_, i) => `Columna ${i + 1}`);
+  const body = rows.slice(hi >= 0 ? hi + 1 : 0);
+  const map = hi >= 0 ? guessMapping(header) : { date: -1, desc: -1, out: -1, inn: -1, amount: -1 };
+  pending = { name, header, rows: body, map };
+  showMapper();
 }
 
 function showMapper() {
@@ -1142,7 +1156,22 @@ const drop = $('#drop');
 ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
 ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
 drop.addEventListener('drop', e => handleFiles([...e.dataTransfer.files]));
-$('#fileInput').addEventListener('change', e => { handleFiles([...e.target.files]); e.target.value = ''; });
+$('#fileInput').addEventListener('change', e => {
+  const files = [...(e.target.files || [])];
+  if (!files.length) { $('#importMsg').innerHTML = '<div class="msg err">No se recibió ningún archivo. Si estás en el celular, prueba pegando los movimientos (más abajo).</div>'; return; }
+  $('#importMsg').innerHTML = `<div class="msg ok">Leyendo ${esc(files[0].name)}…</div>`;
+  handleFiles(files).finally(() => { e.target.value = ''; });
+});
+$('#pasteGo').addEventListener('click', () => {
+  const text = $('#pasteText').value.trim();
+  const msg = $('#importMsg');
+  if (!text) { msg.innerHTML = '<div class="msg err">Pega primero los movimientos en el cuadro.</div>'; return; }
+  try { msg.innerHTML = ''; startMapping('Movimientos pegados', parseCSV(text)); }
+  catch (err) { msg.innerHTML = `<div class="msg err">No pudimos leer lo pegado: ${esc(err.message)}</div>`; }
+});
+window.addEventListener('error', e => {
+  if (ui.tab === 'importar') $('#importMsg').innerHTML = `<div class="msg err">Error inesperado: ${esc(e.message)}. Prueba pegando los movimientos.</div>`;
+});
 $('#mConfirm').addEventListener('click', confirmImport);
 $('#mCancel').addEventListener('click', () => { pending = null; $('#mapperBox').classList.add('hidden'); });
 
